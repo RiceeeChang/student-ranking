@@ -27,9 +27,10 @@ type SubjectScore struct {
 	Score   float64 `json:"score" bson:"score" binding:"required"`
 }
 type Student struct {
-	Name      string         `json:"name" bson:"name"`
-	StudentId string         `json:"student_id" bson:"student_id"`
-	Scores    []SubjectScore `json:"scores" bson:"scores"`
+	Name        string                  `json:"name" bson:"name"`
+	StudentId   string                  `json:"student_id" bson:"student_id"`
+	Scores      map[string]SubjectScore `json:"scores" bson:"scores"`
+	ScoresTotal float64                 `json:"score_total" bson:"score_total"`
 }
 
 var subjects = []string{
@@ -39,6 +40,8 @@ var subjects = []string{
 var mongodb *mongo.Client
 var rdb *redis.Client
 var ctx = context.Background()
+
+var collectionName string = "students"
 
 func main() {
 
@@ -84,17 +87,19 @@ func main() {
 }
 
 func GetStudent(c *gin.Context) {
-	var result bson.D
+	var result Student
 
-	filter := bson.D{{Key: "name", Value: "RiceA"}}
+	filter := bson.D{{Key: "name", Value: "RiceD"}}
 
-	collection := mongodb.Database("testdb").Collection("users")
+	collection := mongodb.Database("testdb").Collection(collectionName)
 
 	err := collection.FindOne(context.TODO(), filter).Decode(&result)
 	if err != nil {
-		log.Fatal(err)
+		// log.Fatal(err)
+		c.JSON(http.StatusBadRequest, gin.H{})
 	}
 
+	fmt.Printf("%T %+v\n", result, result)
 	fmt.Println("Found a document: ", result)
 }
 
@@ -123,36 +128,57 @@ func EditStudent(c *gin.Context) {
 	studentId := c.Param("student_id")
 
 	// check studentId format
+	if len(studentId) != 11 || []rune(studentId)[0] != 'R' {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "student_id format is error."})
+	}
 
 	// check post data
 
-	var studentData Student
+	var updateData Student
 
 	// 使用 Gin 的 ShouldBindJSON 自動綁定 JSON 數據並執行初步驗證
-	if err := c.ShouldBindJSON(&studentData); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := c.ShouldBindJSON(&updateData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data format is error"})
 		return
 	}
 
 	// 使用 validator 進行更詳細的驗證
 
 	validate := validator.New()
-	if err := validate.Struct(studentData); err != nil {
-		validationErrors := err.(validator.ValidationErrors)
-		c.JSON(http.StatusBadRequest, gin.H{"validation_errors": validationErrors.Translate(nil)})
+	if err := validate.Struct(updateData); err != nil {
+		//validationErrors := err.(validator.ValidationErrors)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data format is error"})
 		return
 	}
 
-	fmt.Printf("post data = %+v\n", studentData)
-
-	// 更新資料
-	collection := mongodb.Database("testdb").Collection("users")
+	fmt.Printf("post data = %+v\n", updateData)
 
 	filter := bson.M{"student_id": studentId}
+	collection := mongodb.Database("testdb").Collection(collectionName)
+
+	var result Student
+	err := collection.FindOne(context.TODO(), filter).Decode(&result)
+	if err != nil {
+		// log.Fatal(err)
+		c.JSON(http.StatusBadRequest, gin.H{})
+	}
+
+	// 更新資料
+	for sub, value := range updateData.Scores {
+		result.Scores[sub] = value
+	}
+
+	var total float64 = 0
+
+	for _, value := range result.Scores {
+		total += value.Score
+	}
+
 	update := bson.M{
 		"$set": bson.M{
-			"name":   studentData.Name,
-			"scores": studentData.Scores,
+			"name":        updateData.Name,
+			"scores":      result.Scores,
+			"score_total": total,
 		},
 	}
 
@@ -182,20 +208,7 @@ func GetRank(c *gin.Context) {
 			"message": "number need to integer",
 		})
 	}
-
-	fmt.Printf("%s %d\n", subject, number)
-
-	// 搜尋 redis
-	/*
-		// 添加玩家分數
-		addScore("player1", 300)
-		addScore("player2", 150)
-		addScore("player3", 450)
-		addScore("player4", 600)
-
-		// 獲取排行榜前3名
-		fmt.Println("Top 3 players:")
-		getTopPlayers(rdb, 3)*/
+	getTopPlayers(subject, int64(number))
 }
 
 func addScore(subject string, student Student, score float64) {
@@ -215,14 +228,25 @@ func addScore(subject string, student Student, score float64) {
 func getTopPlayers(subject string, top int64) {
 	key := "rank_" + subject
 
+	fmt.Println("GET " + key)
+
 	players, err := rdb.ZRevRangeWithScores(ctx, key, 0, top-1).Result()
 	if err != nil {
 		fmt.Println("Error fetching top players:", err)
 		return
 	}
 
+	fmt.Printf("list number = %d\n", len(players))
+
 	for i, player := range players {
-		fmt.Printf("Rank %d: %s with score %.0f\n", i+1, player.Member, player.Score)
+
+		var student Student
+		err := json.Unmarshal([]byte(player.Member.(string)), &student)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+
+		fmt.Printf("Rank %d: %s with score %.0f\n", i+1, student.StudentId, player.Score)
 	}
 }
 
@@ -233,46 +257,32 @@ func insertUser(name string) string {
 		log.Fatalf("Failed to get sequence id: %v", err)
 	}
 
-	collection := mongodb.Database("testdb").Collection("users")
+	collection := mongodb.Database("testdb").Collection(collectionName)
 
 	newIdString := fmt.Sprintf("R%010d", newID)
 
-	subjectScores := []SubjectScore{}
+	subjectScores := make(map[string]SubjectScore)
+
+	var total float64 = 0
 
 	for _, sub := range subjects {
-		subjectScores = append(subjectScores, SubjectScore{
-			sub,
-			float64(rand.Intn(101)),
-		})
-	}
 
-	fmt.Printf("%+v\n", subjectScores)
+		sc := float64(rand.Intn(101))
+
+		subjectScores[sub] = SubjectScore{
+			sub,
+			sc,
+		}
+
+		total += sc
+	}
 
 	student := Student{
 		name,
 		newIdString,
 		subjectScores,
+		total,
 	}
-
-	/*scoreChiness := rand.Intn(101)
-	scoreEnglish := rand.Intn(101)
-	scoreMath := rand.Intn(101)
-	//scoreTotal := scoreChiness + scoreEnglish + scoreMath
-
-	user := bson.D{
-		{Key: "student_id", Value: newIdString},
-		{Key: "name", Value: name},
-		//{Key: "score_total", Value: scoreTotal},
-		{Key: "scores", Value: bson.A{
-			bson.D{
-				{Key: "subject", Value: "chinese"},
-				{Key: "score", Value: scoreChiness}},
-			bson.D{
-				{Key: "subject", Value: "english"},
-				{Key: "score", Value: scoreEnglish}},
-			bson.D{
-				{Key: "subject", Value: "math"},
-				{Key: "score", Value: scoreMath}}}}}*/
 
 	studentBSON, err := bson.Marshal(student)
 	if err != nil {
@@ -286,13 +296,11 @@ func insertUser(name string) string {
 
 	fmt.Println("Inserted user with ID:", insertResult.InsertedID)
 
-	//return insertResult.
-	/*
-		addScore("chinese", student, float64(scoreChiness))
-		addScore("english", student, float64(scoreEnglish))
-		addScore("math", student, float64(scoreMath))*/
+	for _, ss := range student.Scores {
+		addScore(ss.Subject, student, ss.Score)
+	}
 
-	return newIdString
+	return student.StudentId
 }
 
 func getNextSequence(name string) (int64, error) {
@@ -310,4 +318,8 @@ func getNextSequence(name string) (int64, error) {
 		return 0, err
 	}
 	return updatedDoc.Seq, nil
+}
+
+func reset() {
+
 }
