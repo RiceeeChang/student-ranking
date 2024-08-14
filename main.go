@@ -2,16 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
+	"strings"
 
 	"log"
 	"strconv"
 
 	"math/rand"
 	"net/http"
-
-	"github.com/go-playground/validator/v10"
 
 	"github.com/gin-gonic/gin"
 
@@ -22,26 +22,29 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type SubjectScore struct {
-	Subject string  `json:"subject" bson:"subject" validate:"oneof=chinese english math"`
-	Score   float64 `json:"score" bson:"score" binding:"required"`
-}
 type Student struct {
-	Name        string                  `json:"name" bson:"name"`
-	StudentId   string                  `json:"student_id" bson:"student_id"`
-	Scores      map[string]SubjectScore `json:"scores" bson:"scores"`
-	ScoresTotal float64                 `json:"score_total" bson:"score_total"`
-}
+	Name      string `json:"name" bson:"name"`
+	StudentId string `json:"student_id" bson:"student_id"`
+	Scores    map[string]float64
 
-var subjects = []string{
-	"chinese", "english", "math",
+	//ScoresTotal float64 `json:"score_total" bson:"score_total"`
+	//ScoreChinese float64 `json:"score_chinese" bson:"score_chinese"`
+	//ScoreEnglish float64 `json:"score_english" bson:"score_english"`
+	//ScoreMath    float64 `json:"score_math" bson:"score_math"`
 }
 
 var mongodb *mongo.Client
 var rdb *redis.Client
 var ctx = context.Background()
 
-var collectionName string = "students"
+const (
+	collectionName string = "students"
+	rankListKey    string = "ranklist_"
+	hashKey        string = "student_data_"
+	scoreKey       string = "student_score_"
+)
+
+var subjects = []string{"chinese", "english", "math"}
 
 func main() {
 
@@ -87,20 +90,53 @@ func main() {
 }
 
 func GetStudent(c *gin.Context) {
-	var result Student
 
-	filter := bson.D{{Key: "name", Value: "RiceD"}}
+	studentIdsString := c.Query("student_id")
 
-	collection := mongodb.Database("testdb").Collection(collectionName)
-
-	err := collection.FindOne(context.TODO(), filter).Decode(&result)
-	if err != nil {
-		// log.Fatal(err)
+	if studentIdsString == "" {
 		c.JSON(http.StatusBadRequest, gin.H{})
 	}
 
-	fmt.Printf("%T %+v\n", result, result)
-	fmt.Println("Found a document: ", result)
+	studentIds := strings.Split(studentIdsString, ",")
+	sort.Strings(studentIds)
+
+	students := make([]map[string]interface{}, 0)
+
+	for _, studentId := range studentIds {
+		student := make(map[string]interface{})
+
+		result, err := rdb.HGetAll(ctx, hashKey+studentId).Result()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		if len(result) == 0 {
+			continue
+		}
+
+		for k, v := range result {
+			student[k] = v
+		}
+
+		result, err = rdb.HGetAll(ctx, scoreKey+studentId).Result()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		student["scores"] = result
+
+		rank := make(map[string]int64)
+		for _, v := range subjects {
+			rank[v] = getRankNum(v, studentId)
+		}
+
+		rank["total"] = getRankNum("total", studentId)
+		student["rank"] = rank
+
+		students = append(students, student)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"result": students,
+	})
 }
 
 func AddStudent(c *gin.Context) {
@@ -117,140 +153,7 @@ func AddStudent(c *gin.Context) {
 		return
 	}
 
-	studentId := insertUser(data.Name)
-
-	c.JSON(http.StatusOK, gin.H{
-		"student_id": studentId,
-	})
-}
-
-func EditStudent(c *gin.Context) {
-	studentId := c.Param("student_id")
-
-	// check studentId format
-	if len(studentId) != 11 || []rune(studentId)[0] != 'R' {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "student_id format is error."})
-	}
-
-	// check post data
-
-	var updateData Student
-
-	// 使用 Gin 的 ShouldBindJSON 自動綁定 JSON 數據並執行初步驗證
-	if err := c.ShouldBindJSON(&updateData); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "data format is error"})
-		return
-	}
-
-	// 使用 validator 進行更詳細的驗證
-
-	validate := validator.New()
-	if err := validate.Struct(updateData); err != nil {
-		//validationErrors := err.(validator.ValidationErrors)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "data format is error"})
-		return
-	}
-
-	fmt.Printf("post data = %+v\n", updateData)
-
-	filter := bson.M{"student_id": studentId}
-	collection := mongodb.Database("testdb").Collection(collectionName)
-
-	var result Student
-	err := collection.FindOne(context.TODO(), filter).Decode(&result)
-	if err != nil {
-		// log.Fatal(err)
-		c.JSON(http.StatusBadRequest, gin.H{})
-	}
-
-	// 更新資料
-	for sub, value := range updateData.Scores {
-		result.Scores[sub] = value
-	}
-
-	var total float64 = 0
-
-	for _, value := range result.Scores {
-		total += value.Score
-	}
-
-	update := bson.M{
-		"$set": bson.M{
-			"name":        updateData.Name,
-			"scores":      result.Scores,
-			"score_total": total,
-		},
-	}
-
-	updateResult, err := collection.UpdateOne(context.TODO(), filter, update)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Matched %v documents and updated %v documents.\n", updateResult.MatchedCount, updateResult.ModifiedCount)
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "success",
-	})
-
-	// 更新redis
-
-}
-
-func GetRank(c *gin.Context) {
-	subject := c.Param("subject")
-
-	numberString := c.DefaultQuery("number", "10")
-	number, err := strconv.Atoi(numberString)
-
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"message": "number need to integer",
-		})
-	}
-	getTopPlayers(subject, int64(number))
-}
-
-func addScore(subject string, student Student, score float64) {
-	studentJSON, err := json.Marshal(student)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	key := "rank_" + subject
-
-	rdb.ZAdd(ctx, key, redis.Z{
-		Score:  score,
-		Member: studentJSON,
-	})
-}
-
-func getTopPlayers(subject string, top int64) {
-	key := "rank_" + subject
-
-	fmt.Println("GET " + key)
-
-	players, err := rdb.ZRevRangeWithScores(ctx, key, 0, top-1).Result()
-	if err != nil {
-		fmt.Println("Error fetching top players:", err)
-		return
-	}
-
-	fmt.Printf("list number = %d\n", len(players))
-
-	for i, player := range players {
-
-		var student Student
-		err := json.Unmarshal([]byte(player.Member.(string)), &student)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-
-		fmt.Printf("Rank %d: %s with score %.0f\n", i+1, student.StudentId, player.Score)
-	}
-}
-
-func insertUser(name string) string {
+	// 取得新的ID
 	newID, err := getNextSequence("student_id")
 
 	if err != nil {
@@ -261,27 +164,20 @@ func insertUser(name string) string {
 
 	newIdString := fmt.Sprintf("R%010d", newID)
 
-	subjectScores := make(map[string]SubjectScore)
-
-	var total float64 = 0
-
-	for _, sub := range subjects {
-
-		sc := float64(rand.Intn(101))
-
-		subjectScores[sub] = SubjectScore{
-			sub,
-			sc,
-		}
-
-		total += sc
-	}
+	scoreChinese := float64(rand.Intn(101))
+	scoreEnglish := float64(rand.Intn(101))
+	scoreMath := float64(rand.Intn(101))
+	scoreTotal := scoreChinese + scoreEnglish + scoreMath
 
 	student := Student{
-		name,
-		newIdString,
-		subjectScores,
-		total,
+		Name:      data.Name,
+		StudentId: newIdString,
+		Scores: map[string]float64{
+			"chinese": scoreChinese,
+			"english": scoreEnglish,
+			"math":    scoreMath,
+			"total":   scoreTotal,
+		},
 	}
 
 	studentBSON, err := bson.Marshal(student)
@@ -296,11 +192,158 @@ func insertUser(name string) string {
 
 	fmt.Println("Inserted user with ID:", insertResult.InsertedID)
 
-	for _, ss := range student.Scores {
-		addScore(ss.Subject, student, ss.Score)
+	addToRedis(student)
+
+	c.JSON(http.StatusOK, gin.H{
+		"student_id": newIdString,
+	})
+}
+
+func addToRedis(student Student) {
+	rdb.HSet(ctx, hashKey+student.StudentId,
+		"name", student.Name,
+		"student_id", student.StudentId,
+		//"score_toal", student.ScoresTotal,
+	)
+
+	rdb.HSet(ctx, scoreKey+student.StudentId,
+		"chinese", student.Scores["chinese"],
+		"english", student.Scores["english"],
+		"math", student.Scores["math"],
+		"total", student.Scores["total"],
+	)
+
+	rdb.ZAdd(ctx, rankListKey+"chinese", redis.Z{Score: student.Scores["chinese"], Member: student.StudentId})
+	rdb.ZAdd(ctx, rankListKey+"english", redis.Z{Score: student.Scores["english"], Member: student.StudentId})
+	rdb.ZAdd(ctx, rankListKey+"math", redis.Z{Score: student.Scores["math"], Member: student.StudentId})
+	rdb.ZAdd(ctx, rankListKey+"total", redis.Z{Score: student.Scores["total"], Member: student.StudentId})
+}
+
+func EditStudent(c *gin.Context) {
+	studentId := c.Param("student_id")
+
+	// check studentId format
+	if len(studentId) != 11 || []rune(studentId)[0] != 'R' {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "student_id format is error."})
 	}
 
-	return student.StudentId
+	// check post data
+	var updateData map[string]int64
+	if err := c.BindJSON(&updateData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data format is error"})
+		return
+	}
+	fmt.Printf("post data = %+v\n", updateData)
+
+	var student Student
+	filter := bson.M{"student_id": studentId}
+	collection := mongodb.Database("testdb").Collection(collectionName)
+	err := collection.FindOne(context.TODO(), filter).Decode(&student)
+	if err != nil {
+		// log.Fatal(err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message": "no student",
+		})
+		return
+	}
+
+	// 只更新成績
+	for key, value := range updateData {
+		fmt.Printf("key = %s\n", key)
+
+		if !slices.Contains(subjects, key) {
+			fmt.Println("not contain " + key)
+			continue
+		}
+
+		student.Scores[key] = float64(value)
+
+		rdb.HSet(ctx, scoreKey+student.StudentId,
+			key, value,
+		)
+		rdb.ZAdd(ctx, rankListKey+key, redis.Z{Score: float64(value), Member: student.StudentId})
+	}
+
+	fmt.Printf("%+v\n", student)
+
+	var total float64 = 0
+	for _, v := range subjects {
+		total += student.Scores[v]
+	}
+	student.Scores["total"] = total
+	rdb.HSet(ctx, scoreKey+student.StudentId,
+		"total", student.Scores["total"],
+	)
+	rdb.ZAdd(ctx, rankListKey+"total", redis.Z{Score: student.Scores["total"], Member: student.StudentId})
+
+	update := bson.M{
+		"$set": bson.M{
+			"scores": student.Scores,
+		},
+	}
+
+	updateResult, err := collection.UpdateOne(context.TODO(), filter, update)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Matched %v documents and updated %v documents.\n", updateResult.MatchedCount, updateResult.ModifiedCount)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "success",
+	})
+	// 更新redis
+}
+
+func GetRank(c *gin.Context) {
+	subject := c.Param("subject")
+
+	numberString := c.DefaultQuery("number", "10")
+	number, err := strconv.Atoi(numberString)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message": "number need to integer",
+		})
+	}
+	ranklist := getTopPlayers(subject, int64(number))
+
+	c.JSON(http.StatusOK, gin.H{
+		"result": ranklist,
+	})
+}
+
+func getTopPlayers(subject string, top int64) map[int]map[string]interface{} {
+	key := rankListKey + subject
+
+	fmt.Println("GET " + key)
+
+	players, err := rdb.ZRevRangeWithScores(ctx, key, 0, top-1).Result()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	fmt.Printf("list number = %d\n", len(players))
+
+	rankList := make(map[int]map[string]interface{})
+
+	for i, player := range players {
+
+		rankList[i+1] = map[string]interface{}{
+			"student_id": player.Member,
+			"score":      player.Score,
+		}
+	}
+
+	return rankList
+}
+
+func getRankNum(subject string, studentId string) int64 {
+	key := rankListKey + subject
+	rank, err := rdb.ZRevRank(ctx, key, studentId).Result()
+	if err != nil {
+		fmt.Println("Error:", err)
+	}
+	return rank
 }
 
 func getNextSequence(name string) (int64, error) {
@@ -318,8 +361,4 @@ func getNextSequence(name string) (int64, error) {
 		return 0, err
 	}
 	return updatedDoc.Seq, nil
-}
-
-func reset() {
-
 }
