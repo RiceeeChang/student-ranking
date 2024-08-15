@@ -26,11 +26,6 @@ type Student struct {
 	Name      string `json:"name" bson:"name"`
 	StudentId string `json:"student_id" bson:"student_id"`
 	Scores    map[string]float64
-
-	//ScoresTotal float64 `json:"score_total" bson:"score_total"`
-	//ScoreChinese float64 `json:"score_chinese" bson:"score_chinese"`
-	//ScoreEnglish float64 `json:"score_english" bson:"score_english"`
-	//ScoreMath    float64 `json:"score_math" bson:"score_math"`
 }
 
 var mongodb *mongo.Client
@@ -47,6 +42,8 @@ const (
 var subjects = []string{"chinese", "english", "math"}
 
 func main() {
+
+	fmt.Printf("ctx = %+v\n", ctx)
 
 	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
 
@@ -90,6 +87,7 @@ func main() {
 }
 
 func GetStudent(c *gin.Context) {
+	fmt.Printf("%+v\n", c)
 
 	studentIdsString := c.Query("student_id")
 
@@ -105,31 +103,45 @@ func GetStudent(c *gin.Context) {
 	for _, studentId := range studentIds {
 		student := make(map[string]interface{})
 
+		fmt.Printf("Search RDS Hash %s\n", hashKey+studentId)
 		result, err := rdb.HGetAll(ctx, hashKey+studentId).Result()
 		if err != nil {
 			log.Fatal(err.Error())
 		}
+
 		if len(result) == 0 {
-			continue
+			// 從mongo中搜尋
+			student = getStudentFromMongo(studentId)
+			if len(student) == 0 {
+				continue
+			}
+
+		} else {
+
+			for k, v := range result {
+				student[k] = v
+			}
+
+			result, err = rdb.HGetAll(ctx, scoreKey+studentId).Result()
+			if err != nil {
+				log.Fatal(err.Error())
+			}
+			if len(result) == 0 {
+				student = getStudentFromMongo(studentId)
+				if len(student) == 0 {
+					continue
+				}
+			} else {
+				student["scores"] = result
+			}
 		}
 
-		for k, v := range result {
-			student[k] = v
-		}
-
-		result, err = rdb.HGetAll(ctx, scoreKey+studentId).Result()
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		student["scores"] = result
-
-		rank := make(map[string]int64)
+		ranks := make(map[string]int64)
 		for _, v := range subjects {
-			rank[v] = getRankNum(v, studentId)
+			ranks[v] = getRankNum(v, studentId)
 		}
-
-		rank["total"] = getRankNum("total", studentId)
-		student["rank"] = rank
+		ranks["total"] = getRankNum("total", studentId)
+		student["rank"] = ranks
 
 		students = append(students, student)
 	}
@@ -343,7 +355,7 @@ func getRankNum(subject string, studentId string) int64 {
 	if err != nil {
 		fmt.Println("Error:", err)
 	}
-	return rank
+	return rank + 1
 }
 
 func getNextSequence(name string) (int64, error) {
@@ -361,4 +373,29 @@ func getNextSequence(name string) (int64, error) {
 		return 0, err
 	}
 	return updatedDoc.Seq, nil
+}
+
+func getStudentFromMongo(studentId string) map[string]interface{} {
+	student := make(map[string]interface{})
+
+	// 從mongo中搜尋
+	collection := mongodb.Database("testdb").Collection(collectionName)
+	filter := bson.D{{Key: "student_id", Value: studentId}}
+	var result Student
+	err := collection.FindOne(context.TODO(), filter).Decode(&result)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return student
+		} else {
+			log.Fatal(err)
+		}
+	}
+	// 把資料寫到redis
+	addToRedis(result)
+
+	student["name"] = result.Name
+	student["student_id"] = result.StudentId
+	student["scores"] = result.Scores
+
+	return student
 }
