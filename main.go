@@ -45,7 +45,8 @@ func main() {
 
 	fmt.Printf("ctx = %+v\n", ctx)
 
-	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	mongoDNS := "Mongo"
+	clientOptions := options.Client().ApplyURI("mongodb://" + mongoDNS + ":27017")
 
 	var err error
 	mongodb, err = mongo.Connect(context.TODO(), clientOptions)
@@ -67,10 +68,11 @@ func main() {
 
 	fmt.Println("Connected to MongoDB!")
 
+	redisDomain := "Redis"
 	rdb = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // Redis 服務器地址
-		Password: "",               // 沒有密碼，則設置為空字符串
-		DB:       0,                // 使用默認的 DB
+		Addr:     redisDomain + ":6379", // Redis 服務器地址
+		Password: "",                    // 沒有密碼，則設置為空字符串
+		DB:       0,                     // 使用默認的 DB
 	})
 	// 檢查連接是否成功
 	pong, err := rdb.Ping(ctx).Result()
